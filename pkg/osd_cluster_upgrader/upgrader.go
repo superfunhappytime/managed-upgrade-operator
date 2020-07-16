@@ -2,6 +2,8 @@ package osd_cluster_upgrader
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/openshift/managed-upgrade-operator/pkg/maintenance"
 	"github.com/openshift/managed-upgrade-operator/pkg/metrics"
 	"github.com/openshift/managed-upgrade-operator/pkg/scaler"
+	"github.com/openshift/managed-upgrade-operator/pkg/servicelog"
 )
 
 var (
@@ -67,6 +70,17 @@ func NewClient(c client.Client, cfm configmanager.ConfigManager, mc metrics.Metr
 		return nil, err
 	}
 
+	// create service log POC
+	slc, err := servicelog.NewServiceLogClient(c, "Managed Upgrade Operator")
+	if err != nil {
+		return nil, err
+	}
+
+	// attach to existing metrics client
+	if mc, err = slc.AttachToMetricsClient(c, mc); err != nil {
+		return nil, err
+	}
+
 	steps = map[upgradev1alpha1.UpgradeConditionType]UpgradeStep{
 		upgradev1alpha1.UpgradePreHealthCheck:         PreClusterHealthCheck,
 		upgradev1alpha1.UpgradeScaleUpExtraNodes:      EnsureExtraUpgradeWorkers,
@@ -84,27 +98,29 @@ func NewClient(c client.Client, cfm configmanager.ConfigManager, mc metrics.Metr
 	}
 
 	return &osdClusterUpgrader{
-		Steps:       steps,
-		Ordering:    osdUpgradeStepOrdering,
-		client:      c,
-		maintenance: m,
-		metrics:     mc,
-		scaler:      scaler.NewScaler(),
-		cfg:         cfg,
-		machinery:   machinery.NewMachinery(),
+		Steps:         steps,
+		Ordering:      osdUpgradeStepOrdering,
+		client:        c,
+		maintenance:   m,
+		metrics:       mc,
+		scaler:        scaler.NewScaler(),
+		cfg:           cfg,
+		machinery:     machinery.NewMachinery(),
+		serviceLogger: slc,
 	}, nil
 }
 
 // An OSD cluster upgrader implementing the ClusterUpgrader interface
 type osdClusterUpgrader struct {
-	Steps       UpgradeSteps
-	Ordering    UpgradeStepOrdering
-	client      client.Client
-	maintenance maintenance.Maintenance
-	metrics     metrics.Metrics
-	scaler      scaler.Scaler
-	cfg         *osdUpgradeConfig
-	machinery   machinery.Machinery
+	Steps         UpgradeSteps
+	Ordering      UpgradeStepOrdering
+	client        client.Client
+	maintenance   maintenance.Maintenance
+	metrics       metrics.Metrics
+	scaler        scaler.Scaler
+	cfg           *osdUpgradeConfig
+	machinery     machinery.Machinery
+	serviceLogger servicelog.ServiceLogger
 }
 
 // PreClusterHealthCheck performs cluster healthy check
@@ -500,6 +516,12 @@ func ControlPlaneUpgraded(c client.Client, cfg *osdUpgradeConfig, scaler scaler.
 func (cu osdClusterUpgrader) UpgradeCluster(upgradeConfig *upgradev1alpha1.UpgradeConfig, logger logr.Logger) (upgradev1alpha1.UpgradePhase, *upgradev1alpha1.UpgradeCondition, error) {
 	logger.Info("Upgrading cluster")
 
+	// service log poc uses simple sha1 of start time for event id
+	s := sha1.New()
+	s.Write([]byte(time.Now().String()))
+	cu.serviceLogger.SetUpgradeEventID(base64.URLEncoding.EncodeToString(s.Sum(nil)))
+	cu.serviceLogger.CreateLog("Upgrade Starting", "Its party time")
+
 	for _, key := range cu.Ordering {
 
 		logger.Info(fmt.Sprintf("Performing %s", key))
@@ -520,6 +542,7 @@ func (cu osdClusterUpgrader) UpgradeCluster(upgradeConfig *upgradev1alpha1.Upgra
 
 	key := cu.Ordering[len(cu.Ordering)-1]
 	condition := newUpgradeCondition(fmt.Sprintf("%s done", key), fmt.Sprintf("%s is completed", key), key, corev1.ConditionTrue)
+	cu.serviceLogger.CreateLog("Upgrade completed", fmt.Sprintf("%s is completed", key))
 	return upgradev1alpha1.UpgradePhaseUpgraded, condition, nil
 }
 
